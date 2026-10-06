@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Iterable
 from ... import errors
 from ...types import DataType
 from ...types import _CollectionDataTypeDef, _DataTypeDef, _FunctionDataTypeDef, _MappingDataTypeDef
+from ...unknown import UnknownSource, first_unknown, is_unknown
 
 from ..base import ExpressionBase, LiteralExpressionBase, _is_reduced
 
@@ -58,13 +59,19 @@ class SymbolExpression(ExpressionBase):
         return "<{0} name={1!r} >".format(self.__class__.__name__, self.name)
 
     def evaluate(self, thing: Any) -> Any:
+        context = self.context
         try:
-            value = self.context.resolve(thing, self.name, scope=self.scope)
-        except errors.SymbolResolutionError:
-            default_value = self.context.default_value
-            if default_value is errors.UNDEFINED:
-                raise
-            value = default_value
+            value = context.resolve(thing, self.name, scope=self.scope)
+        except errors.SymbolResolutionError as error:
+            value = context._handle_unknown(UnknownSource.MISSING, self.name, error=error, use_legacy_default=True)
+        except errors.DataParseError as error:
+            value = context._handle_unknown(UnknownSource.PARSE_ERROR, self.name, error=error)
+        if is_unknown(value):
+            # 未知值不参与类型检查，直接携带来源信息传播
+            return value
+        value = context._check_masked(value, self.name)
+        if is_unknown(value):
+            return value
         value = self._new_value(value, verify_type=False)
 
         # if the expected result type is undefined, return the value
@@ -146,9 +153,15 @@ class FunctionCallExpression(ExpressionBase):
 
     def evaluate(self, thing: Any) -> Any:
         function = self.function.evaluate(thing)
+        if is_unknown(function):
+            return function
         if not callable(function):
             raise errors.EvaluationError('data type mismatch (not a callable value)')
         arguments = tuple(argument.evaluate(thing) for argument in self.arguments)
+        # 严格语义：任一参数为 UNKNOWN 时不调用函数，直接传播最早的未知来源
+        unknown_argument = first_unknown(*arguments)
+        if unknown_argument is not None:
+            return unknown_argument
         function_name: str | None = '<unknown>'
         if self.function.result_type != DataType.UNDEFINED:
             function_type = self.function.result_type
@@ -164,6 +177,9 @@ class FunctionCallExpression(ExpressionBase):
             raise error
         except Exception as error:
             raise errors.FunctionCallError('function call failed', error=error, function_name=function_name) from None
+        if is_unknown(result):
+            # 自定义函数可以主动返回 UnknownValue 以引入未知语义
+            return result
         result = self._new_value(result)
         if not DataType.is_compatible(DataType.from_value(result), self.result_type):
             raise errors.FunctionCallError('function call failed (data type mismatch on returned value)', function_name=function_name)

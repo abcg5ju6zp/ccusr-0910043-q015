@@ -47,6 +47,7 @@ from .. import errors
 from .. import types
 from ..suggestions import suggest_symbol
 from ..types import DataType, _DataTypeDef
+from ..unknown import MASKED, UnknownPolicy, UnknownSource, UnknownValue
 
 from ._attribute_resolver import _AttributeResolver
 
@@ -149,7 +150,8 @@ class Context(object):
                     default_timezone: str | datetime.tzinfo = 'local',
                     default_value: Any = errors.UNDEFINED,
                     decimal_context: decimal.Context | None = None,
-                    mapping_attribute_lookup: bool = True
+                    mapping_attribute_lookup: bool = True,
+                    unknown_policy: UnknownPolicy | str | collections.abc.Mapping[str, str] | None = None
     ) -> None:
         """项目内部接口说明。"""
         self.regex_flags = regex_flags
@@ -189,6 +191,11 @@ class Context(object):
         self.__resolver = resolver or resolve_item
         self.mapping_attribute_lookup = mapping_attribute_lookup
         """The *mapping_attribute_lookup* parameter from :py:meth:`~__init__`."""
+        self.unknown_policy = UnknownPolicy.from_value(unknown_policy)
+        """The *unknown_policy* parameter from :py:meth:`~__init__`, normalized to an :py:class:`~rule_engine.unknown.UnknownPolicy`."""
+        # 历史默认：仅符号/属性解析在配置了 default_value 时对缺失字段兜底（use_legacy_default=True 的调用点），
+        # 其余来源与其它调用点默认中止，保证旧规则维持二值结果
+        self._legacy_missing_action = 'fallback' if default_value is not errors.UNDEFINED else 'abort'
         self._mapping_fallback_lock = threading.Lock()
         self._mapping_fallback_warned = False
 
@@ -200,6 +207,7 @@ class Context(object):
                 'default_value': self.default_value,
                 'decimal_context': self.decimal_context,
                 'mapping_attribute_lookup': self.mapping_attribute_lookup,
+                'unknown_policy': self.unknown_policy,
                 '_mapping_fallback_warned': self._mapping_fallback_warned,
                 '_Context__type_resolver': self.__type_resolver,
                 '_Context__resolver': self.__resolver,
@@ -212,6 +220,9 @@ class Context(object):
         self.default_value = state['default_value']
         self.decimal_context = state['decimal_context']
         self.mapping_attribute_lookup = state['mapping_attribute_lookup']
+        # pickles written before unknown_policy existed fall back to the unconfigured default
+        self.unknown_policy = state.get('unknown_policy') or UnknownPolicy()
+        self._legacy_missing_action = 'fallback' if self.default_value is not errors.UNDEFINED else 'abort'
         self._mapping_fallback_warned = state['_mapping_fallback_warned']
         self.__type_resolver = state['_Context__type_resolver']
         self.__resolver = state['_Context__resolver']
@@ -259,6 +270,33 @@ class Context(object):
         """项目内部接口说明。"""
         return self.__resolve_attribute(thing, object_, name)
     resolve_attribute_type = __resolve_attribute.resolve_type
+
+    def _handle_unknown(self, source: UnknownSource, symbol: str | None, error: errors.EvaluationError | None = None, use_legacy_default: bool = False) -> Any:
+        """按 unknown_policy 处理一次未知值事件。
+
+        * ``'propagate'`` —— 返回携带来源信息的 :py:class:`~rule_engine.unknown.UnknownValue`。
+        * ``'fallback'`` —— 返回 :py:attr:`default_value`（未配置时为 ``None``）。
+        * ``'abort'`` —— 抛出 *error*；未提供 *error* 时（受权限遮蔽）抛出 :py:class:`~rule_engine.errors.SymbolMaskedError`。
+
+        未显式配置的来源取历史默认：符号/属性解析点（*use_legacy_default*）在配置了
+        ``default_value`` 时兜底、否则中止；其余情况一律中止。
+        """
+        action = self.unknown_policy.action_for(source)
+        if action is None:
+            action = self._legacy_missing_action if (use_legacy_default and source is UnknownSource.MISSING) else 'abort'
+        if action == 'propagate':
+            return UnknownValue(source, symbol)
+        if action == 'fallback':
+            return self.default_value if self.default_value is not errors.UNDEFINED else None
+        if error is not None:
+            raise error
+        raise errors.SymbolMaskedError(symbol if symbol is not None else '?')
+
+    def _check_masked(self, value: Any, symbol: str | None) -> Any:
+        """若解析得到的 *value* 是 :py:data:`~rule_engine.unknown.MASKED` 哨兵，则按 masked 策略处理。"""
+        if value is MASKED:
+            return self._handle_unknown(UnknownSource.MASKED, symbol)
+        return value
 
     def _warn_mapping_fallback(self, attribute_name: str) -> None:
         with self._mapping_fallback_lock:

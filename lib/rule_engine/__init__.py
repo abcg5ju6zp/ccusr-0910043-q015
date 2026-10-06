@@ -41,22 +41,37 @@ from .engine import Context
 from .engine import Rule
 
 from .errors import AttributeResolutionError
+from .errors import DataParseError
 from .errors import EngineError
 from .errors import EvaluationError
 from .errors import RuleSyntaxError
+from .errors import SymbolMaskedError
 from .errors import SymbolResolutionError
 
 from .types import DataType
 
+from .unknown import MASKED
+from .unknown import UnknownPolicy
+from .unknown import UnknownSource
+from .unknown import UnknownValue
+from .unknown import is_unknown
+
 __all__ = (
     'AttributeResolutionError',
     'Context',
+    'DataParseError',
     'DataType',
     'EngineError',
     'EvaluationError',
+    'MASKED',
     'Rule',
     'RuleSyntaxError',
+    'SymbolMaskedError',
     'SymbolResolutionError',
+    'UnknownPolicy',
+    'UnknownSource',
+    'UnknownValue',
+    'is_unknown',
     'resolve_attribute',
     'resolve_item',
     'type_resolver_from_dataclass',

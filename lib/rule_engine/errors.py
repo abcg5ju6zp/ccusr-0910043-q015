@@ -44,6 +44,9 @@ class _UNDEFINED(object):
         return False
     __name__ = 'UNDEFINED'
     __nonzero__ = __bool__
+    def __reduce__(self) -> str:
+        # pickle by reference so the singleton identity (and `is UNDEFINED` checks) survives pickling
+        return 'UNDEFINED'
     def __repr__(self) -> str:
         return self.__name__
 UNDEFINED = _UNDEFINED()
@@ -215,6 +218,33 @@ class SymbolResolutionError(EvaluationError):
 
     def __repr__(self) -> str:
         return "<{} message={!r} suggestion={!r} >".format(self.__class__.__name__, self.message, self.suggestion)
+
+class DataParseError(EvaluationError):
+    """字段值存在但无法解析为可用值时，由自定义 resolver 抛出。
+
+    引擎按 ``Context(unknown_policy=...)`` 的 ``'parse_error'`` 动作处理：传播为
+    ``UnknownValue``、以默认值兜底或（默认）原样抛出。消息中不应包含字段内容，
+    以便在传播/兜底路径上安全地记录日志。
+    """
+    def __init__(self, symbol_name: str, message: str | None = None, error: BaseException | None = None) -> None:
+        self.symbol_name = symbol_name
+        """The name of the symbol whose value could not be parsed."""
+        self.error = error
+        """The underlying exception (if any) that caused the parse to fail."""
+        super(DataParseError, self).__init__(message or "failed to parse value for symbol: {0!r}".format(symbol_name))
+
+    def __repr__(self) -> str:
+        return "<{} message={!r} >".format(self.__class__.__name__, self.message)
+
+class SymbolMaskedError(EvaluationError):
+    """字段受权限遮蔽且 ``unknown_policy`` 的 ``'masked'`` 动作为 ``'abort'`` 时抛出。"""
+    def __init__(self, symbol_name: str) -> None:
+        self.symbol_name = symbol_name
+        """The name of the symbol that is masked by permissions."""
+        super(SymbolMaskedError, self).__init__("symbol {0!r} is masked".format(symbol_name))
+
+    def __repr__(self) -> str:
+        return "<{} message={!r} >".format(self.__class__.__name__, self.message)
 
 class SymbolTypeError(EvaluationError):
     """项目内部接口说明。"""

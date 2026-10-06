@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 from ... import errors
 from ...types import DataType
 from ...types import _DataTypeDef
+from ...unknown import is_unknown
 
 from ..base import ExpressionBase, LiteralExpressionBase, _is_reduced
 
@@ -80,7 +81,8 @@ class CoalesceExpression(ExpressionBase):
 
     def evaluate(self, thing: Any) -> Any:
         left_value = self.left.evaluate(thing)
-        if left_value is None:
+        # UNKNOWN 与 NULL 一样触发兜底：左操作数不可用时取右操作数
+        if left_value is None or is_unknown(left_value):
             return self.right.evaluate(thing)
         return left_value
 

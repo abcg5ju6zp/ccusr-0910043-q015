@@ -38,6 +38,7 @@ from typing import Any, Callable
 from ... import errors
 from ...types import DataType, coerce_value
 from ...types import _DataTypeDef
+from ...unknown import first_unknown, is_unknown
 
 from ..base import _assert_is_bytes, _assert_is_natural_number, _assert_is_numeric, _assert_is_string, _assert_not_nullable, _is_reduced
 from .base import BinaryExpressionBase
@@ -68,6 +69,9 @@ class AddExpression(BinaryExpressionBase):
     def _op_add(self, thing: Any) -> Any:
         left_value = self.left.evaluate(thing)
         right_value = self.right.evaluate(thing)
+        unknown = first_unknown(left_value, right_value)
+        if unknown is not None:
+            return unknown
         if isinstance(left_value, datetime.datetime):
             if not isinstance(right_value, datetime.timedelta):
                 raise errors.EvaluationError('data type mismatch (not a timedelta value)')
@@ -111,6 +115,9 @@ class SubtractExpression(BinaryExpressionBase):
     def _op_sub(self, thing: Any) -> Any:
         left_value = self.left.evaluate(thing)
         right_value = self.right.evaluate(thing)
+        unknown = first_unknown(left_value, right_value)
+        if unknown is not None:
+            return unknown
         if isinstance(left_value, datetime.datetime):
             if not isinstance(right_value, (datetime.datetime, datetime.timedelta)):
                 raise errors.EvaluationError('data type mismatch (not a datetime or timedelta value)')
@@ -132,8 +139,12 @@ class ArithmeticExpression(BinaryExpressionBase):
 
     def __op_arithmetic(self, op: Callable[[Any, Any], Any], thing: Any) -> Any:
         left_value = self.left.evaluate(thing)
+        if is_unknown(left_value):
+            return left_value
         _assert_is_numeric(left_value)
         right_value = self.right.evaluate(thing)
+        if is_unknown(right_value):
+            return right_value
         _assert_is_numeric(right_value)
         try:
             result = op(left_value, right_value)
@@ -174,6 +185,8 @@ class BitwiseExpression(BinaryExpressionBase):
 
     def _op_bitwise(self, op: Callable[[Any, Any], Any], thing: Any) -> Any:
         left = self.left.evaluate(thing)
+        if is_unknown(left):
+            return left
         if DataType.from_value(left) == DataType.FLOAT:
             return self._op_bitwise_float(op, thing, left)
         elif DataType.is_type(DataType.from_value(left), DataType.SET):
@@ -183,11 +196,15 @@ class BitwiseExpression(BinaryExpressionBase):
     def _op_bitwise_float(self, op: Callable[[Any, Any], Any], thing: Any, left: Any) -> Any:
         _assert_is_natural_number(left)
         right = self.right.evaluate(thing)
+        if is_unknown(right):
+            return right
         _assert_is_natural_number(right)
         return coerce_value(op(int(left), int(right)))
 
     def _op_bitwise_set(self, op: Callable[[Any, Any], Any], thing: Any, left: Any) -> Any:
         right = self.right.evaluate(thing)
+        if is_unknown(right):
+            return right
         if not DataType.is_compatible(DataType.from_value(right), DataType.SET):
             raise errors.EvaluationError('data type mismatch')
         return op(left, right)

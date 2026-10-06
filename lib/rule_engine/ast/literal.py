@@ -37,6 +37,7 @@ from .. import errors
 from ..parser.utilities import parse_datetime, parse_float, parse_timedelta
 from ..types import DataType, coerce_value
 from ..types import _DataTypeDef
+from ..unknown import is_unknown
 
 from .base import ExpressionBase, LiteralExpressionBase, _is_reduced, _iterable_member_value_type
 
@@ -51,7 +52,14 @@ class _CollectionMixin(object):
     result_type: _DataTypeDef
     value: Any
     def evaluate(self, thing: Any) -> Any:
-        return self.result_type.python_type(member.evaluate(thing) for member in self.value)
+        members = []
+        for member in self.value:
+            member_value = member.evaluate(thing)
+            if is_unknown(member_value):
+                # 容器内不允许出现 UNKNOWN 元素，整个字面量传播为未知
+                return member_value
+            members.append(member_value)
+        return self.result_type.python_type(members)
 
     @property
     def is_reduced(self) -> bool:  # type: ignore[override]
@@ -136,13 +144,18 @@ class MappingExpression(LiteralExpressionBase):
         mapping: 'collections.OrderedDict[Any, Any]' = collections.OrderedDict()
         for key, value in self.value:
             key = key.evaluate(thing)
+            if is_unknown(key):
+                return key
             key_type = DataType.from_value(key)
             if key_type.is_compound and not DataType.is_type(key_type, DataType.ARRAY):
                 raise errors.EngineError("the {} data type may not be used for mapping keys".format(key_type.name))
             mapping[key] = value
         # 延迟值求解，避免对重复键的值执行多余计算
         for key, value in mapping.items():
-            mapping[key] = value.evaluate(thing)
+            member_value = value.evaluate(thing)
+            if is_unknown(member_value):
+                return member_value
+            mapping[key] = member_value
         return mapping
 
     @property

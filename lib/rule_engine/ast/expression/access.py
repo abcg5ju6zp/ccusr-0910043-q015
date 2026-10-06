@@ -39,6 +39,7 @@ from ... import errors
 from ...suggestions import suggest_symbol
 from ...types import DataType, coerce_value
 from ...types import _DataTypeDef
+from ...unknown import UnknownSource, is_unknown
 
 from ..base import (
         ExpressionBase,
@@ -85,10 +86,14 @@ class ContainsExpression(ExpressionBase):
     def __repr__(self) -> str:
         return "<{0} container={1!r} member={2!r} >".format(self.__class__.__name__, self.container, self.member)
 
-    def evaluate(self, thing: Any) -> bool:
+    def evaluate(self, thing: Any) -> Any:
         container_value = self.container.evaluate(thing)
-        container_value_type = DataType.from_value(container_value)
+        if is_unknown(container_value):
+            return container_value
         member_value = self.member.evaluate(thing)
+        if is_unknown(member_value):
+            return member_value
+        container_value_type = DataType.from_value(container_value)
         if container_value_type == DataType.BYTES or container_value_type == DataType.STRING:
             if DataType.from_value(member_value) != container_value_type:
                 raise errors.EvaluationError('data type mismatch')
@@ -162,6 +167,8 @@ class GetAttributeExpression(ExpressionBase):
 
     def evaluate(self, thing: Any) -> Any:
         resolved_obj = self.object.evaluate(thing)
+        if is_unknown(resolved_obj):
+            return resolved_obj
         if resolved_obj is None and self.safe:
             return resolved_obj
         if resolved_obj is None and DataType.is_type(self.object.result_type, DataType.NULLABLE):
@@ -173,15 +180,21 @@ class GetAttributeExpression(ExpressionBase):
             try:
                 value = self._object_type.accessor(resolved_obj, self.name)
             except (AttributeError, KeyError):
-                default_value = self.context.default_value
-                if default_value is errors.UNDEFINED:
-                    raise errors.ObjectAttributeError(
-                            self.name,
-                            self._object_type,
-                            thing=thing,
-                            suggestion=suggest_symbol(self.name, self._object_type.attributes.keys())
-                    ) from None
-                value = default_value
+                value = self.context._handle_unknown(
+                        UnknownSource.MISSING,
+                        self.name,
+                        error=errors.ObjectAttributeError(
+                                self.name,
+                                self._object_type,
+                                thing=thing,
+                                suggestion=suggest_symbol(self.name, self._object_type.attributes.keys())
+                        ),
+                        use_legacy_default=True
+                )
+            else:
+                value = self.context._check_masked(value, self.name)
+            if is_unknown(value):
+                return value
             return self._new_value(value, verify_type=False)
 
         attribute_error = None
@@ -189,7 +202,15 @@ class GetAttributeExpression(ExpressionBase):
             value = self.context.resolve_attribute(thing, resolved_obj, self.name)
         except errors.AttributeResolutionError as error:
             attribute_error = error
+        except errors.DataParseError as error:
+            value = self.context._handle_unknown(UnknownSource.PARSE_ERROR, self.name, error=error)
+            if is_unknown(value):
+                return value
+            return self._new_value(value, verify_type=False)
         else:
+            value = self.context._check_masked(value, self.name)
+            if is_unknown(value):
+                return value
             return self._new_value(value, verify_type=False)
 
         if isinstance(resolved_obj, collections.abc.Mapping) and not isinstance(resolved_obj, _builtins.Builtins):
@@ -200,15 +221,18 @@ class GetAttributeExpression(ExpressionBase):
         try:
             value = self.context.resolve(resolved_obj, self.name)
         except errors.SymbolResolutionError as symbol_error:
-            default_value = self.context.default_value
-            if default_value is errors.UNDEFINED:
-                suggestion = attribute_error.suggestion or symbol_error.suggestion
-                if attribute_error.suggestion and symbol_error.suggestion:
-                    # if there are two suggestions, select the best one
-                    suggestion = suggest_symbol(self.name, (attribute_error.suggestion, symbol_error.suggestion))
-                attribute_error.suggestion = suggestion
-                raise attribute_error from None
-            value = default_value
+            suggestion = attribute_error.suggestion or symbol_error.suggestion
+            if attribute_error.suggestion and symbol_error.suggestion:
+                # if there are two suggestions, select the best one
+                suggestion = suggest_symbol(self.name, (attribute_error.suggestion, symbol_error.suggestion))
+            attribute_error.suggestion = suggestion
+            value = self.context._handle_unknown(UnknownSource.MISSING, self.name, error=attribute_error, use_legacy_default=True)
+        except errors.DataParseError as parse_error:
+            value = self.context._handle_unknown(UnknownSource.PARSE_ERROR, self.name, error=parse_error)
+        else:
+            value = self.context._check_masked(value, self.name)
+        if is_unknown(value):
+            return value
         return self._new_value(value, verify_type=False)
 
     def reduce(self) -> ExpressionBase:
@@ -280,21 +304,37 @@ class GetItemExpression(ExpressionBase):
 
     def evaluate(self, thing: Any) -> Any:
         resolved_obj = self.container.evaluate(thing)
+        if is_unknown(resolved_obj):
+            return resolved_obj
         if resolved_obj is None:
             if self.safe:
                 return resolved_obj
             raise errors.EvaluationError('data type mismatch (container is null)')
 
         resolved_item = self.item.evaluate(thing)
+        if is_unknown(resolved_item):
+            return resolved_item
         if isinstance(resolved_obj, (bytes, str, tuple)):
             _assert_is_integer_number(resolved_item)
             resolved_item = int(resolved_item)
+        symbol = resolved_item if isinstance(resolved_item, str) else None
         try:
             value = operator.getitem(resolved_obj, resolved_item)
         except (IndexError, KeyError):
             if self.safe:
                 return None
-            raise errors.LookupError(resolved_obj, resolved_item)
+            # 注意：历史默认对缺失的键/索引一律中止（不套用 default_value），仅显式配置策略时才兜底或传播
+            value = self.context._handle_unknown(
+                    UnknownSource.MISSING,
+                    symbol,
+                    error=errors.LookupError(resolved_obj, resolved_item)
+            )
+            if is_unknown(value):
+                return value
+            return self._new_value(value, verify_type=False)
+        value = self.context._check_masked(value, symbol)
+        if is_unknown(value):
+            return value
         return self._new_value(value, verify_type=False)
 
     def reduce(self) -> ExpressionBase:
@@ -375,16 +415,22 @@ class GetSliceExpression(ExpressionBase):
 
     def evaluate(self, thing: Any) -> Any:
         resolved_obj = self.container.evaluate(thing)
+        if is_unknown(resolved_obj):
+            return resolved_obj
         if resolved_obj is None:
             if self.safe:
                 return resolved_obj
             raise errors.EvaluationError('data type mismatch')
 
         resolved_start = self.start.evaluate(thing)
+        if is_unknown(resolved_start):
+            return resolved_start
         if resolved_start is not None:
             _assert_is_integer_number(resolved_start)
             resolved_start = int(resolved_start)
         resolved_stop = self.stop.evaluate(thing)
+        if is_unknown(resolved_stop):
+            return resolved_stop
         if resolved_stop is not None:
             _assert_is_integer_number(resolved_stop)
             resolved_stop = int(resolved_stop)
