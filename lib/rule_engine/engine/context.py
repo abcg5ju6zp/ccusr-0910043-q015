@@ -45,6 +45,7 @@ from .. import ast  # noqa: F401 — must be imported before builtins to avoid a
 from .. import builtins
 from .. import errors
 from .. import types
+from .. import unknown
 from ..suggestions import suggest_symbol
 from ..types import DataType, _DataTypeDef
 
@@ -149,7 +150,8 @@ class Context(object):
                     default_timezone: str | datetime.tzinfo = 'local',
                     default_value: Any = errors.UNDEFINED,
                     decimal_context: decimal.Context | None = None,
-                    mapping_attribute_lookup: bool = True
+                    mapping_attribute_lookup: bool = True,
+                    unknown_policy: 'unknown.UnknownPolicy | None' = None
     ) -> None:
         """项目内部接口说明。"""
         self.regex_flags = regex_flags
@@ -159,6 +161,12 @@ class Context(object):
         规则引用的符号集合，其中部分或全部符号需要在求值时解析。
         This attribute can be used after a rule is generated to ensure that all symbols are valid before it is
         evaluated.
+        """
+        self.unknown_policy: 'unknown.UnknownPolicy | None' = unknown_policy
+        """
+        未知值处置策略。``None``（默认）维持历史二值行为：解析失败抛出异常、缺失符号按
+        *default_value* 处理；设置为 :py:class:`~rule_engine.unknown.UnknownPolicy` 后，字段缺失、
+        解析异常与受权限遮蔽按原因分别传播、兜底或中止，并在整个表达式中遵守同一张三值真值表。
         """
         if isinstance(default_timezone, str):
             default_timezone = default_timezone.lower()
@@ -200,6 +208,7 @@ class Context(object):
                 'default_value': self.default_value,
                 'decimal_context': self.decimal_context,
                 'mapping_attribute_lookup': self.mapping_attribute_lookup,
+                'unknown_policy': self.unknown_policy,
                 '_mapping_fallback_warned': self._mapping_fallback_warned,
                 '_Context__type_resolver': self.__type_resolver,
                 '_Context__resolver': self.__resolver,
@@ -213,6 +222,8 @@ class Context(object):
         self.decimal_context = state['decimal_context']
         self.mapping_attribute_lookup = state['mapping_attribute_lookup']
         self._mapping_fallback_warned = state['_mapping_fallback_warned']
+        # 旧版本 pickle 中没有该字段，缺失时回落到历史二值行为
+        self.unknown_policy = state.get('unknown_policy')
         self.__type_resolver = state['_Context__type_resolver']
         self.__resolver = state['_Context__resolver']
         # recreate transient objects that can not be pickled

@@ -49,6 +49,10 @@ def _to_decimal(value: Any) -> decimal.Decimal:
 
 def coerce_value(value: Any, verify_type: bool = True) -> Any:
     """项目内部接口说明。"""
+    # 未知值不参与任何类型强转，原样透传以继续走三值真值表
+    from ..unknown import UnknownValue
+    if isinstance(value, UnknownValue):
+        return value
     # ARRAY
     if isinstance(value, (list, range, tuple)):
         value = tuple(coerce_value(v, verify_type=verify_type) for v in value)

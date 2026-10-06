@@ -36,7 +36,7 @@ from ... import errors
 from ...types import DataType
 from ...types import _DataTypeDef
 
-from ..base import ExpressionBase, LiteralExpressionBase, _is_reduced
+from ..base import ExpressionBase, LiteralExpressionBase, _is_reduced, _reconcile_type_error
 
 if TYPE_CHECKING:
     from ...engine.context import Context
@@ -85,7 +85,20 @@ class BinaryExpressionBase(ExpressionBase):
         return "<{} type={!r} >".format(self.__class__.__name__, self.type)
 
     def evaluate(self, thing: Any) -> Any:
-        return self._evaluator(thing)
+        try:
+            return self._evaluator(thing)
+        except TypeError as error:
+            # 无类型上下文时，原生运算（如 str + number）可能抛出 TypeError 而不是引擎的 EvaluationError：
+            # 有未知值策略时把它归因为数据字段解析失败，便于传播 / 兜底 / 中止；无策略时维持原异常
+            if self.context.unknown_policy is None:
+                raise
+            reconciled = _reconcile_type_error(
+                    self.context, self.left, self.right,
+                    detail='operator {0!r} received an incompatible value ({1})'.format(self.type, error)
+            )
+            if reconciled is errors.UNDEFINED:
+                raise
+            return reconciled
 
     def reduce(self) -> ExpressionBase:
         if not _is_reduced(self.left, self.right):

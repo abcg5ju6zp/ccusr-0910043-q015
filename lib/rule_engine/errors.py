@@ -33,10 +33,11 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 if TYPE_CHECKING:
     from .types.definitions import _DataTypeDef
+    from .unknown import UnknownReason, UnknownValue
 
 
 class _UNDEFINED(object):
@@ -245,3 +246,45 @@ class FunctionCallError(EvaluationError):
 
 class ArithmeticError(EvaluationError):
     """项目内部接口说明。"""
+
+class UnknownFieldError(EvaluationError):
+    """由属性解析器 / 自定义函数显式上报的“字段未知”信号。
+
+    与普通 :py:class:`EvaluationError` 不同，它不表示规则写错了，而是表示该字段的值此刻
+    不可知：缺失、无法解析或被权限遮蔽。引擎会按 :py:class:`~rule_engine.unknown.UnknownPolicy`
+    裁决为传播（生成 :py:class:`~rule_engine.unknown.UnknownValue`）、兜底或中止。
+
+    *source* 只允许填写规则侧的路径名称（如 ``('person', 'date_of_birth')``），*detail* 只能是
+    不含字段内容的说明，以保证异常信息可以安全地展示给客服。
+    """
+    def __init__(
+            self,
+            reason: 'UnknownReason | str',
+            message: str,
+            *,
+            source: Sequence[str] | None = None,
+            detail: str | None = None
+    ) -> None:
+        from .unknown import UnknownReason
+        self.reason = UnknownReason(reason)
+        self.source: tuple[str, ...] = tuple(part for part in (source or ()) if part)
+        self.detail = detail
+        super(UnknownFieldError, self).__init__(message)
+
+    def __repr__(self) -> str:
+        return "<{} reason={!r} source={!r} message={!r} >".format(
+                self.__class__.__name__, self.reason.value, self.source, self.message
+        )
+
+class UnknownAbortError(EvaluationError):
+    """策略要求遇到未知值时中止求值。"""
+    def __init__(self, unknown: 'UnknownValue') -> None:
+        from .unknown import UnknownValue
+        if not isinstance(unknown, UnknownValue):
+            raise TypeError('argument 1 must be an UnknownValue')
+        self.unknown = unknown
+        """触发中止的 :py:class:`~rule_engine.unknown.UnknownValue`（只含来源，不含字段内容）。"""
+        source = '.'.join(unknown.source) if unknown.source else '<root>'
+        super(UnknownAbortError, self).__init__(
+                "evaluation aborted on unknown value (reason: {0}, source: {1})".format(unknown.reason.value, source)
+        )

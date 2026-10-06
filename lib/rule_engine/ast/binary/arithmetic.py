@@ -39,7 +39,18 @@ from ... import errors
 from ...types import DataType, coerce_value
 from ...types import _DataTypeDef
 
-from ..base import _assert_is_bytes, _assert_is_natural_number, _assert_is_numeric, _assert_is_string, _assert_not_nullable, _is_reduced
+from ..base import (
+        _TYPE_GUARD_OK,
+        _assert_is_bytes,
+        _assert_is_natural_number,
+        _assert_is_numeric,
+        _assert_is_string,
+        _assert_not_nullable,
+        _is_reduced,
+        _is_unknown,
+        _reconcile_type_error,
+        _type_guard,
+)
 from .base import BinaryExpressionBase
 
 class AddExpression(BinaryExpressionBase):
@@ -67,19 +78,41 @@ class AddExpression(BinaryExpressionBase):
 
     def _op_add(self, thing: Any) -> Any:
         left_value = self.left.evaluate(thing)
+        if _is_unknown(left_value):
+            return left_value
         right_value = self.right.evaluate(thing)
+        if _is_unknown(right_value):
+            return right_value
         if isinstance(left_value, datetime.datetime):
             if not isinstance(right_value, datetime.timedelta):
+                reconciled = _reconcile_type_error(
+                        self.context, self.left, self.right,
+                        detail="right operand of '+' must be a timedelta"
+                )
+                if reconciled is not errors.UNDEFINED:
+                    return reconciled
                 raise errors.EvaluationError('data type mismatch (not a timedelta value)')
         elif isinstance(left_value, datetime.timedelta):
             if not isinstance(right_value, (datetime.timedelta, datetime.datetime)):
+                reconciled = _reconcile_type_error(
+                        self.context, self.left, self.right,
+                        detail="right operand of '+' must be a datetime or timedelta"
+                )
+                if reconciled is not errors.UNDEFINED:
+                    return reconciled
                 raise errors.EvaluationError('data type mismatch (not a datetime or timedelta value)')
         elif isinstance(left_value, bytes) or isinstance(right_value, bytes):
-            _assert_is_bytes(left_value, right_value)
+            guarded = _type_guard(self.context, (self.left, self.right), "'+' operands must be bytes", _assert_is_bytes, left_value, right_value)
+            if guarded is not _TYPE_GUARD_OK:
+                return guarded
         elif isinstance(left_value, str) or isinstance(right_value, str):
-            _assert_is_string(left_value, right_value)
+            guarded = _type_guard(self.context, (self.left, self.right), "'+' operands must be strings", _assert_is_string, left_value, right_value)
+            if guarded is not _TYPE_GUARD_OK:
+                return guarded
         else:
-            _assert_is_numeric(left_value, right_value)
+            guarded = _type_guard(self.context, (self.left, self.right), "'+' operands must be numeric, strings, bytes or datetime", _assert_is_numeric, left_value, right_value)
+            if guarded is not _TYPE_GUARD_OK:
+                return guarded
         return operator.add(left_value, right_value)
 
 class SubtractExpression(BinaryExpressionBase):
@@ -110,15 +143,33 @@ class SubtractExpression(BinaryExpressionBase):
 
     def _op_sub(self, thing: Any) -> Any:
         left_value = self.left.evaluate(thing)
+        if _is_unknown(left_value):
+            return left_value
         right_value = self.right.evaluate(thing)
+        if _is_unknown(right_value):
+            return right_value
         if isinstance(left_value, datetime.datetime):
             if not isinstance(right_value, (datetime.datetime, datetime.timedelta)):
+                reconciled = _reconcile_type_error(
+                        self.context, self.left, self.right,
+                        detail="right operand of '-' must be a datetime or timedelta"
+                )
+                if reconciled is not errors.UNDEFINED:
+                    return reconciled
                 raise errors.EvaluationError('data type mismatch (not a datetime or timedelta value)')
         elif isinstance(left_value, datetime.timedelta):
             if not isinstance(right_value, datetime.timedelta):
+                reconciled = _reconcile_type_error(
+                        self.context, self.left, self.right,
+                        detail="right operand of '-' must be a timedelta"
+                )
+                if reconciled is not errors.UNDEFINED:
+                    return reconciled
                 raise errors.EvaluationError('data type mismatch (not a timedelta value)')
         else:
-            _assert_is_numeric(left_value, right_value)
+            guarded = _type_guard(self.context, (self.left, self.right), "'-' operands must be numeric, datetime or timedelta", _assert_is_numeric, left_value, right_value)
+            if guarded is not _TYPE_GUARD_OK:
+                return guarded
         return operator.sub(left_value, right_value)
 
 class ArithmeticExpression(BinaryExpressionBase):
@@ -132,9 +183,21 @@ class ArithmeticExpression(BinaryExpressionBase):
 
     def __op_arithmetic(self, op: Callable[[Any, Any], Any], thing: Any) -> Any:
         left_value = self.left.evaluate(thing)
-        _assert_is_numeric(left_value)
+        if _is_unknown(left_value):
+            return left_value
         right_value = self.right.evaluate(thing)
-        _assert_is_numeric(right_value)
+        if _is_unknown(right_value):
+            return right_value
+        guarded = _type_guard(
+                self.context,
+                (self.left, self.right),
+                'arithmetic operands are not numeric',
+                _assert_is_numeric,
+                left_value,
+                right_value
+        )
+        if guarded is not _TYPE_GUARD_OK:
+            return guarded
         try:
             result = op(left_value, right_value)
         except ZeroDivisionError:
@@ -174,22 +237,50 @@ class BitwiseExpression(BinaryExpressionBase):
 
     def _op_bitwise(self, op: Callable[[Any, Any], Any], thing: Any) -> Any:
         left = self.left.evaluate(thing)
-        if DataType.from_value(left) == DataType.FLOAT:
+        if _is_unknown(left):
+            return left
+        left_type = DataType.from_value(left)
+        if left_type == DataType.FLOAT:
             return self._op_bitwise_float(op, thing, left)
-        elif DataType.is_type(DataType.from_value(left), DataType.SET):
+        elif DataType.is_type(left_type, DataType.SET):
             return self._op_bitwise_set(op, thing, left)
+        reconciled = _reconcile_type_error(
+                self.context, self.left, self.right,
+                detail='bitwise operands must be integer numbers or sets'
+        )
+        if reconciled is not errors.UNDEFINED:
+            return reconciled
         raise errors.EvaluationError('data type mismatch')
 
     def _op_bitwise_float(self, op: Callable[[Any, Any], Any], thing: Any, left: Any) -> Any:
-        _assert_is_natural_number(left)
+        guarded = _type_guard(self.context, (self.left,), 'bitwise operand must be a natural number', _assert_is_natural_number, left)
+        if guarded is not _TYPE_GUARD_OK:
+            return guarded
         right = self.right.evaluate(thing)
-        _assert_is_natural_number(right)
+        if _is_unknown(right):
+            return right
+        guarded = _type_guard(self.context, (self.left, self.right), 'bitwise operand must be a natural number', _assert_is_natural_number, left, right)
+        if guarded is not _TYPE_GUARD_OK:
+            return guarded
         return coerce_value(op(int(left), int(right)))
 
     def _op_bitwise_set(self, op: Callable[[Any, Any], Any], thing: Any, left: Any) -> Any:
         right = self.right.evaluate(thing)
+        if _is_unknown(right):
+            return right
         if not DataType.is_compatible(DataType.from_value(right), DataType.SET):
+            reconciled = _reconcile_type_error(
+                    self.context, self.left, self.right,
+                    detail='set bitwise operands must both be sets'
+            )
+            if reconciled is not errors.UNDEFINED:
+                return reconciled
             raise errors.EvaluationError('data type mismatch')
+        # 集合中混入未知成员时交/并/对称差均不可确定：传播首个未知成员及其来源
+        for collection in (left, right):
+            pending = next((member for member in collection if _is_unknown(member)), None)
+            if pending is not None:
+                return pending
         return op(left, right)
 
     _op_bwand = functools.partialmethod(_op_bitwise, operator.and_)

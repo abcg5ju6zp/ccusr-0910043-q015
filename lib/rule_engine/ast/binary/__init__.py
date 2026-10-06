@@ -36,7 +36,7 @@ from ... import errors
 from ...types import DataType
 from ...types import _DataTypeDef
 
-from ..base import ExpressionBase, LiteralExpressionBase, _is_reduced
+from ..base import ExpressionBase, LiteralExpressionBase, _is_reduced, _is_unknown
 
 from .arithmetic import AddExpression, ArithmeticExpression, BitwiseExpression, BitwiseShiftExpression, SubtractExpression
 from .base import BinaryExpressionBase
@@ -80,7 +80,8 @@ class CoalesceExpression(ExpressionBase):
 
     def evaluate(self, thing: Any) -> Any:
         left_value = self.left.evaluate(thing)
-        if left_value is None:
+        # null 与未知值都由右侧兜底；未知值在进入兜底前已经携带了可追溯的来源
+        if left_value is None or _is_unknown(left_value):
             return self.right.evaluate(thing)
         return left_value
 

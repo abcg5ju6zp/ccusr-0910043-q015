@@ -31,14 +31,33 @@
 #
 
 import decimal
-from typing import Any, Iterable, Iterator, TYPE_CHECKING
+from typing import Any, Iterable, Iterator, TYPE_CHECKING, NamedTuple
 
 from .. import errors
 from ..parser import Parser
+from ..unknown import UnknownValue
 from .context import Context
 
 if TYPE_CHECKING:
     import graphviz
+
+class TernaryResult(NamedTuple):
+    """规则的三值求值结果。
+
+    .. py:attribute:: match
+
+       ``True`` / ``False`` 为明确结论；``None`` 表示结论未知（存在传播到根的未知值）。
+
+    .. py:attribute:: unknowns
+
+       导致结论未知的全部未知值，按出现顺序去重；只含来源与原因，不含字段内容。
+    """
+    match: bool | None
+    unknowns: tuple[UnknownValue, ...]
+
+    def explain(self) -> list[dict[str, Any]]:
+        """返回可安全记录 / 回传给客服的未知来源说明列表。"""
+        return [unknown.explain() for unknown in self.unknowns]
 
 class Rule(object):
     """项目内部接口说明。"""
@@ -70,6 +89,7 @@ class Rule(object):
 
     def filter(self, things: Iterable[Any]) -> Iterator[Any]:
         """项目内部接口说明。"""
+        # 未知结论一律不进入“符合条件”集合
         yield from (thing for thing in things if self.matches(thing))
 
     @classmethod
@@ -87,9 +107,30 @@ class Rule(object):
         with decimal.localcontext(self.context.decimal_context):
             return self.statement.evaluate(thing)
 
+    def evaluate_ternary(self, thing: Any) -> TernaryResult:
+        """三值求值：返回 :py:class:`TernaryResult`。
+
+        仅当根表达式求值为未知值（未知沿逻辑链一路传播到结论）时，
+        :py:attr:`~TernaryResult.match` 才为 ``None``。集合 / 推导结果中的未知成员属于数据本身，
+        不改变根结论；调用方仍可通过 :py:meth:`evaluate` 取回其中保留的未知来源。
+
+        旧规则（上下文无 :py:class:`~rule_engine.unknown.UnknownPolicy`）只会得到明确的布尔结论。
+        """
+        result = self.evaluate(thing)
+        if isinstance(result, UnknownValue):
+            return TernaryResult(None, (result,))
+        return TernaryResult(bool(result), ())
+
     def matches(self, thing: Any) -> bool:
-        """项目内部接口说明。"""
-        return bool(self.evaluate(thing))
+        """二值判定（向后兼容）。
+
+        配置了传播型策略时，未知结论会被压成 ``False``；需要区分“不符合”与“资料未到齐”的调用方
+        请改用 :py:meth:`evaluate_ternary`。
+        """
+        result = self.evaluate(thing)
+        if isinstance(result, UnknownValue):
+            return False
+        return bool(result)
 
     def to_graphviz(self) -> 'graphviz.Digraph':
         """项目内部接口说明。"""

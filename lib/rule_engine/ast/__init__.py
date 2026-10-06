@@ -37,6 +37,7 @@ from .base import (
         ExpressionBase,
         LiteralExpressionBase,
         Statement,
+        _adjudicate,
         _assert_is_bytes,
         _assert_is_integer_number,
         _assert_is_natural_number,
@@ -44,8 +45,11 @@ from .base import (
         _assert_is_string,
         _assert_not_nullable,
         _is_reduced,
+        _is_unknown,
         _iterable_member_value_type,
         _resolve_type,
+        _reconcile_type_error,
+        _type_guard,
 )
 from .literal import (
         ArrayExpression,

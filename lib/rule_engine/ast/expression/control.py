@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from ... import errors
 from ...types import DataType, is_numeric
 from ...types import _DataTypeDef
+from ... import unknown
 
 from ..base import (
         Assignment,
@@ -46,6 +47,7 @@ from ..base import (
         LiteralExpressionBase,
         _assert_not_nullable,
         _is_reduced,
+        _is_unknown,
         _propagate_nullable,
         _resolve_type,
 )
@@ -104,13 +106,29 @@ class ComprehensionExpression(ExpressionBase):
     def evaluate(self, thing: Any) -> Any:
         output_array: 'collections.deque[Any]' = collections.deque()
         input_iterable = self.iterable.evaluate(thing)
+        if _is_unknown(input_iterable):
+            return input_iterable
         if not DataType.from_value(input_iterable).is_iterable:
+            from ..base import _reconcile_type_error
+            reconciled = _reconcile_type_error(
+                    self.context, self.iterable,
+                    detail='comprehension requires an iterable value'
+            )
+            if reconciled is not errors.UNDEFINED:
+                return reconciled
             raise errors.EvaluationError('data type mismatch (comprehension requires an iterable)')
         for value in input_iterable:
             assignment = Assignment(self.variable, value=value)
             with self.context.assignments(assignment):
-                if self.condition is None or self.condition.evaluate(thing):
+                if self.condition is None:
                     output_array.append(self.result.evaluate(thing))
+                else:
+                    condition_value = self.condition.evaluate(thing)
+                    if _is_unknown(condition_value):
+                        # 未知条件的元素既不能入选也不算明确被排除：跳过，但不影响其余元素
+                        continue
+                    if condition_value:
+                        output_array.append(self.result.evaluate(thing))
         return tuple(output_array)
 
     def to_graphviz(self, digraph: Any, *args: Any, **kwargs: Any) -> None:
@@ -153,7 +171,11 @@ class TernaryExpression(ExpressionBase):
         return reduced
 
     def evaluate(self, thing: Any) -> Any:
-        case = (self.case_true if self.condition.evaluate(thing) else self.case_false)
+        condition_value = self.condition.evaluate(thing)
+        # 条件未知时无法选择分支：传播未知，两个分支都不求值
+        if _is_unknown(condition_value):
+            return condition_value
+        case = (self.case_true if condition_value else self.case_false)
         return case.evaluate(thing)
 
     def reduce(self) -> ExpressionBase:
@@ -206,13 +228,25 @@ class UnaryExpression(ExpressionBase):
         return self._evaluator(thing)
 
     def __op(self, op: Callable[[Any], Any], thing: Any) -> Any:
-        return op(self.right.evaluate(thing))
+        value = self.right.evaluate(thing)
+        if self.type == 'not':
+            return unknown.logic_not(value)
+        return op(value)
 
     _op_not = functools.partialmethod(__op, operator.not_)
 
     def __op_arithmetic(self, op: Callable[[Any], Any], thing: Any) -> Any:
         right = self.right.evaluate(thing)
+        if _is_unknown(right):
+            return right
         if not is_numeric(right) and not isinstance(right, datetime.timedelta):
+            from ..base import _reconcile_type_error
+            reconciled = _reconcile_type_error(
+                    self.context, self.right,
+                    detail='unary minus operand must be numeric or timedelta'
+            )
+            if reconciled is not errors.UNDEFINED:
+                return reconciled
             raise errors.EvaluationError('data type mismatch (not a numeric or timedelta value)')
         return op(right)
 

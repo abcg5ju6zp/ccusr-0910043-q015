@@ -39,14 +39,22 @@ from .engine import type_resolver_from_dict
 from .engine import type_resolver_from_sqlalchemy
 from .engine import Context
 from .engine import Rule
+from .engine import TernaryResult
 
 from .errors import AttributeResolutionError
 from .errors import EngineError
 from .errors import EvaluationError
 from .errors import RuleSyntaxError
 from .errors import SymbolResolutionError
+from .errors import UnknownAbortError
+from .errors import UnknownFieldError
 
 from .types import DataType
+
+from .unknown import UnknownAction
+from .unknown import UnknownPolicy
+from .unknown import UnknownReason
+from .unknown import UnknownValue
 
 __all__ = (
     'AttributeResolutionError',
@@ -57,6 +65,13 @@ __all__ = (
     'Rule',
     'RuleSyntaxError',
     'SymbolResolutionError',
+    'TernaryResult',
+    'UnknownAbortError',
+    'UnknownAction',
+    'UnknownFieldError',
+    'UnknownPolicy',
+    'UnknownReason',
+    'UnknownValue',
     'resolve_attribute',
     'resolve_item',
     'type_resolver_from_dataclass',

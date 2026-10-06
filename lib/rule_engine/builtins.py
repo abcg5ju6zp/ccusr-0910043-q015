@@ -41,15 +41,62 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from . import errors
 from . import types
+from . import unknown
 from .parser.utilities import parse_datetime, parse_float, parse_timedelta
 
 import dateutil.tz
 
 def _builtin_filter(function: Callable[[Any], Any], iterable: Iterable[Any]) -> tuple[Any, ...]:
-    return tuple(filter(function, iterable))
+    # 与集合推导的 IF 条件一致：谓词未知的元素既不入选也不报错，按 SQL 三值 WHERE 语义排除
+    output: list[Any] = []
+    for value in iterable:
+        verdict = function(value)
+        if isinstance(verdict, unknown.UnknownValue):
+            continue
+        if verdict:
+            output.append(value)
+    return tuple(output)
 
 def _builtin_map(function: Callable[[Any], Any], iterable: Iterable[Any]) -> tuple[Any, ...]:
     return tuple(map(function, iterable))
+
+def _builtin_any(iterable: Iterable[Any]) -> Any:
+    # Kleene 存在量化：任一为真即真；无真但有未知即未知；否则为假
+    pending: unknown.UnknownValue | None = None
+    for value in iterable:
+        if isinstance(value, unknown.UnknownValue):
+            pending = value if pending is None else pending
+        elif value:
+            return True
+    return pending if pending is not None else False
+
+def _builtin_all(iterable: Iterable[Any]) -> Any:
+    # Kleene 全称量化：任一为假即假；无假但有未知即未知；否则为真
+    pending: unknown.UnknownValue | None = None
+    for value in iterable:
+        if isinstance(value, unknown.UnknownValue):
+            pending = value if pending is None else pending
+        elif not value:
+            return False
+    return pending if pending is not None else True
+
+def _builtin_min(iterable: Iterable[Any]) -> Any:
+    # 严格三值语义：成员中存在未知值时最小值不可确定，传播未知（空集合仍按 Python 抛错）
+    values = tuple(iterable)
+    pending = next((value for value in values if isinstance(value, unknown.UnknownValue)), None)
+    return pending if pending is not None else min(values)
+
+def _builtin_max(iterable: Iterable[Any]) -> Any:
+    # 同 _builtin_min
+    values = tuple(iterable)
+    pending = next((value for value in values if isinstance(value, unknown.UnknownValue)), None)
+    return pending if pending is not None else max(values)
+
+def _builtin_sum(iterable: Iterable[Any], start: Any = 0) -> Any:
+    # 任一加数未知则总和未知
+    values = tuple(iterable)
+    pending = next((value for value in values if isinstance(value, unknown.UnknownValue)), None)
+    return pending if pending is not None else sum(values, start)
 
 def _builtin_parse_datetime(builtins: 'Builtins', string: str) -> datetime.datetime:
     return parse_datetime(string, builtins.timezone)
@@ -158,12 +205,12 @@ class Builtins(collections.abc.Mapping):
                 'today': BuiltinValueGenerator(_builtin_today),
                 # functions
                 'abs': abs,
-                'any': any,
-                'all': all,
-                'sum': sum,
+                'any': _builtin_any,
+                'all': _builtin_all,
+                'sum': _builtin_sum,
                 'map': _builtin_map,
-                'max': max,
-                'min': min,
+                'max': _builtin_max,
+                'min': _builtin_min,
                 'filter': _builtin_filter,
                 'parse_datetime': BuiltinValueGenerator(_builtin_parse_datetime_generator),
                 'parse_float': parse_float,

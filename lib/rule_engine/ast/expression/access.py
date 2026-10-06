@@ -39,14 +39,17 @@ from ... import errors
 from ...suggestions import suggest_symbol
 from ...types import DataType, coerce_value
 from ...types import _DataTypeDef
+from ...types import is_integer_number as _is_integer_number
+from ...unknown import UnknownReason, UnknownValue
 
 from ..base import (
         ExpressionBase,
         LiteralExpressionBase,
-        _assert_is_integer_number,
         _assert_not_nullable,
         _is_reduced,
+        _is_unknown,
         _resolve_type,
+        _settle_unknown,
 )
 from ..literal import BooleanExpression, NullExpression
 
@@ -85,14 +88,38 @@ class ContainsExpression(ExpressionBase):
     def __repr__(self) -> str:
         return "<{0} container={1!r} member={2!r} >".format(self.__class__.__name__, self.container, self.member)
 
-    def evaluate(self, thing: Any) -> bool:
+    def evaluate(self, thing: Any) -> Any:
         container_value = self.container.evaluate(thing)
+        if _is_unknown(container_value):
+            return container_value
         container_value_type = DataType.from_value(container_value)
         member_value = self.member.evaluate(thing)
+        if _is_unknown(member_value):
+            return member_value
         if container_value_type == DataType.BYTES or container_value_type == DataType.STRING:
             if DataType.from_value(member_value) != container_value_type:
+                from ..base import _reconcile_type_error
+                reconciled = _reconcile_type_error(
+                        self.context, self.container, self.member,
+                        detail='containment member type must match the bytes/string container'
+                )
+                if reconciled is not errors.UNDEFINED:
+                    return reconciled
                 raise errors.EvaluationError('data type mismatch')
-        return bool(member_value in container_value)
+        result = member_value in container_value
+        if not result:
+            # 未命中但容器含未知成员 / 未知键：待查项可能正是未知值，结论不可确定
+            members: collections.abc.Iterable[Any]
+            if isinstance(container_value, (set, frozenset, tuple)):
+                members = container_value
+            elif isinstance(container_value, collections.abc.Mapping):
+                members = container_value.keys()
+            else:
+                members = ()
+            pending = next((member for member in members if _is_unknown(member)), None)
+            if pending is not None:
+                return pending
+        return bool(result)
 
     def reduce(self) -> ExpressionBase:
         if not _is_reduced(self.container, self.member):
@@ -161,7 +188,10 @@ class GetAttributeExpression(ExpressionBase):
         return "<{0} name={1!r} >".format(self.__class__.__name__, self.name)
 
     def evaluate(self, thing: Any) -> Any:
+        policy = self.context.unknown_policy
         resolved_obj = self.object.evaluate(thing)
+        if _is_unknown(resolved_obj):
+            return resolved_obj.derive(self.name)
         if resolved_obj is None and self.safe:
             return resolved_obj
         if resolved_obj is None and DataType.is_type(self.object.result_type, DataType.NULLABLE):
@@ -169,10 +199,25 @@ class GetAttributeExpression(ExpressionBase):
                     "attribute access on a null value (use ?. to safely navigate a NULLABLE expression)"
             )
 
+        def _missing() -> Any:
+            if policy is None:
+                return errors.UNDEFINED
+            return _settle_unknown(self, UnknownValue(UnknownReason.MISSING, source=(self.name,)))
+
         if self._object_type is not None:
             try:
                 value = self._object_type.accessor(resolved_obj, self.name)
+            except errors.UnknownFieldError as error:
+                if policy is None:
+                    raise
+                unknown = UnknownValue.from_error(error)
+                if not unknown.source:
+                    unknown = unknown.derive(self.name)
+                return _settle_unknown(self, unknown)
             except (AttributeError, KeyError):
+                missing = _missing()
+                if missing is not errors.UNDEFINED:
+                    return missing
                 default_value = self.context.default_value
                 if default_value is errors.UNDEFINED:
                     raise errors.ObjectAttributeError(
@@ -182,14 +227,36 @@ class GetAttributeExpression(ExpressionBase):
                             suggestion=suggest_symbol(self.name, self._object_type.attributes.keys())
                     ) from None
                 value = default_value
+            if _is_unknown(value):
+                return _settle_unknown(self, value)
             return self._new_value(value, verify_type=False)
 
         attribute_error = None
         try:
             value = self.context.resolve_attribute(thing, resolved_obj, self.name)
+        except errors.UnknownFieldError as error:
+            if policy is None:
+                raise
+            unknown = UnknownValue.from_error(error)
+            if not unknown.source:
+                unknown = unknown.derive(self.name)
+            return _settle_unknown(self, unknown)
+        except errors.AttributeTypeError:
+            if policy is None:
+                raise
+            return _settle_unknown(
+                    self,
+                    UnknownValue(
+                            UnknownReason.PARSE_ERROR,
+                            source=(self.name,),
+                            detail='attribute resolved to an incorrect datatype'
+                    )
+            )
         except errors.AttributeResolutionError as error:
             attribute_error = error
         else:
+            if _is_unknown(value):
+                return _settle_unknown(self, value)
             return self._new_value(value, verify_type=False)
 
         if isinstance(resolved_obj, collections.abc.Mapping) and not isinstance(resolved_obj, _builtins.Builtins):
@@ -199,7 +266,17 @@ class GetAttributeExpression(ExpressionBase):
 
         try:
             value = self.context.resolve(resolved_obj, self.name)
+        except errors.UnknownFieldError as error:
+            if policy is None:
+                raise
+            unknown = UnknownValue.from_error(error)
+            if not unknown.source:
+                unknown = unknown.derive(self.name)
+            return _settle_unknown(self, unknown)
         except errors.SymbolResolutionError as symbol_error:
+            missing = _missing()
+            if missing is not errors.UNDEFINED:
+                return missing
             default_value = self.context.default_value
             if default_value is errors.UNDEFINED:
                 suggestion = attribute_error.suggestion or symbol_error.suggestion
@@ -209,12 +286,17 @@ class GetAttributeExpression(ExpressionBase):
                 attribute_error.suggestion = suggestion
                 raise attribute_error from None
             value = default_value
+        if _is_unknown(value):
+            return _settle_unknown(self, value)
         return self._new_value(value, verify_type=False)
 
     def reduce(self) -> ExpressionBase:
         if not _is_reduced(self.object):
             return self
-        literal = LiteralExpressionBase.from_value(self.context, self.evaluate(None))
+        evaluated = self.evaluate(None)
+        if _is_unknown(evaluated):
+            return self
+        literal = LiteralExpressionBase.from_value(self.context, evaluated)
         if literal.result_type == DataType.FUNCTION and DataType.is_compatible(self.result_type, DataType.FUNCTION):
             literal.result_type = self.result_type
         return literal
@@ -280,18 +362,37 @@ class GetItemExpression(ExpressionBase):
 
     def evaluate(self, thing: Any) -> Any:
         resolved_obj = self.container.evaluate(thing)
+        if _is_unknown(resolved_obj):
+            # 容器未知时键仍照常求值（保持与普通运算一致的及早求值），随后把键名补进来源链
+            resolved_item = self.item.evaluate(thing)
+            if _is_unknown(resolved_item):
+                return resolved_item
+            if isinstance(resolved_item, (str, int, float)):
+                return resolved_obj.derive(str(resolved_item))
+            return resolved_obj
         if resolved_obj is None:
             if self.safe:
                 return resolved_obj
             raise errors.EvaluationError('data type mismatch (container is null)')
 
         resolved_item = self.item.evaluate(thing)
+        if _is_unknown(resolved_item):
+            return resolved_item
         if isinstance(resolved_obj, (bytes, str, tuple)):
-            _assert_is_integer_number(resolved_item)
+            if not _is_integer_number(resolved_item):
+                from ..base import _reconcile_type_error
+                reconciled = _reconcile_type_error(self.context, self.item, detail='index must be an integer number')
+                if reconciled is not errors.UNDEFINED:
+                    return reconciled
+                raise errors.EvaluationError('data type mismatch (not an integer number)')
             resolved_item = int(resolved_item)
         try:
             value = operator.getitem(resolved_obj, resolved_item)
         except (IndexError, KeyError):
+            if self.context.unknown_policy is not None:
+                # 键缺失同样是“未知”；安全导航与非安全导航只是在无策略时是否回落到 null 的区别，
+                # 有策略时统一按策略裁决，并保留键名作为来源
+                return _settle_unknown(self, UnknownValue(UnknownReason.MISSING, source=(str(resolved_item),)))
             if self.safe:
                 return None
             raise errors.LookupError(resolved_obj, resolved_item)
@@ -302,7 +403,10 @@ class GetItemExpression(ExpressionBase):
             if self.safe and not DataType.is_compatible(self.item.result_type, self.container.result_type.key_type):
                 return NullExpression(self.context)
         if _is_reduced(self.container, self.item):
-            return LiteralExpressionBase.from_value(self.context, self.evaluate(None))
+            evaluated = self.evaluate(None)
+            if _is_unknown(evaluated):
+                return self
+            return LiteralExpressionBase.from_value(self.context, evaluated)
         return self
 
     def to_graphviz(self, digraph: Any, *args: Any, **kwargs: Any) -> None:
@@ -375,18 +479,34 @@ class GetSliceExpression(ExpressionBase):
 
     def evaluate(self, thing: Any) -> Any:
         resolved_obj = self.container.evaluate(thing)
+        if _is_unknown(resolved_obj):
+            return resolved_obj
         if resolved_obj is None:
             if self.safe:
                 return resolved_obj
             raise errors.EvaluationError('data type mismatch')
 
         resolved_start = self.start.evaluate(thing)
+        if _is_unknown(resolved_start):
+            return resolved_start
         if resolved_start is not None:
-            _assert_is_integer_number(resolved_start)
+            if not _is_integer_number(resolved_start):
+                from ..base import _reconcile_type_error
+                reconciled = _reconcile_type_error(self.context, self.start, detail='slice start must be an integer number')
+                if reconciled is not errors.UNDEFINED:
+                    return reconciled
+                raise errors.EvaluationError('data type mismatch (not an integer number)')
             resolved_start = int(resolved_start)
         resolved_stop = self.stop.evaluate(thing)
+        if _is_unknown(resolved_stop):
+            return resolved_stop
         if resolved_stop is not None:
-            _assert_is_integer_number(resolved_stop)
+            if not _is_integer_number(resolved_stop):
+                from ..base import _reconcile_type_error
+                reconciled = _reconcile_type_error(self.context, self.stop, detail='slice stop must be an integer number')
+                if reconciled is not errors.UNDEFINED:
+                    return reconciled
+                raise errors.EvaluationError('data type mismatch (not an integer number)')
             resolved_stop = int(resolved_stop)
         value = operator.getitem(resolved_obj, slice(resolved_start, resolved_stop))
         return coerce_value(value, verify_type=False)

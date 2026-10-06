@@ -34,6 +34,7 @@ import datetime
 from typing import TYPE_CHECKING, Any, Iterable
 
 from .. import errors
+from .. import unknown
 from ..types import *
 from ..types import _CollectionDataTypeDef, _DataTypeDef, _ReferenceDataTypeDef
 
@@ -63,6 +64,76 @@ def _assert_is_string(*values: Any) -> None:
 def _is_reduced(*values: Any) -> bool:
     """项目内部接口说明。"""
     return all((isinstance(value, LiteralExpressionBase) and value.is_reduced) for value in values)
+
+def _is_unknown(value: Any) -> bool:
+    """判断求值结果是否为未知值。"""
+    return isinstance(value, unknown.UnknownValue)
+
+def _adjudicate(context: 'Context', value: Any) -> Any:
+    """按上下文策略裁决一个未知值；普通值原样返回。
+
+    未知值只能由配置了 :py:class:`~rule_engine.unknown.UnknownPolicy` 的上下文产生，因此这里策略必然存在，
+    但仍保留 ``None`` 检查以容忍自定义解析器直接返回未知值的场景（此时按传播处理）。
+    """
+    if isinstance(value, unknown.UnknownValue) and context.unknown_policy is not None:
+        return context.unknown_policy.resolve(value)
+    return value
+
+def _settle_unknown(expression: 'ExpressionBase', value: Any) -> Any:
+    """裁决未知值；若裁决结果是兜底普通值，则按该节点的常规加载路径完成强转，保证下游类型一致。"""
+    if isinstance(value, unknown.UnknownValue) and expression.context.unknown_policy is None:
+        raise errors.EvaluationError(
+                "an UnknownValue was produced while evaluating but the Context has no unknown_policy"
+        )
+    adjudicated = _adjudicate(expression.context, value)
+    if isinstance(adjudicated, unknown.UnknownValue):
+        return adjudicated
+    return expression._new_value(adjudicated, verify_type=False)
+
+def _data_source_path(expression: Any) -> tuple[str, ...]:
+    """从运算子树中提取数据叶子（符号 / 属性访问）的规则侧路径，用于给类型不匹配归因。"""
+    name = getattr(expression, 'name', None)
+    if isinstance(name, str):
+        obj = getattr(expression, 'object', None)
+        if obj is not None:
+            inner = _data_source_path(obj)
+            return inner + (name,) if inner else (name,)
+        return (name,)
+    return ()
+
+def _reconcile_type_error(context: 'Context', *operands: Any, detail: str) -> Any:
+    """把运算节点的“数据类型不匹配”归因为某个数据字段的解析失败。
+
+    仅当上下文配置了未知值策略、且至少一个操作数可追溯到数据叶子时生效：按策略裁决并返回结果
+    （传播未知值、兜底为整个运算的结果，或中止）。无法归因（无策略 / 全是字面量）时返回
+    :py:data:`~rule_engine.errors.UNDEFINED`，由调用方抛出原来的类型错误。
+    """
+    if context.unknown_policy is None:
+        return errors.UNDEFINED
+    for operand in operands:
+        if isinstance(operand, ExpressionBase):
+            path = _data_source_path(operand)
+            if path:
+                return context.unknown_policy.resolve(
+                        unknown.UnknownValue(unknown.UnknownReason.PARSE_ERROR, source=path, detail=detail)
+                )
+    return errors.UNDEFINED
+
+_TYPE_GUARD_OK = object()
+def _type_guard(context: 'Context', operands: tuple[Any, ...], detail: str, assertion: Any, *values: Any) -> Any:
+    """执行一次原有的类型断言；断言失败时尝试归因为字段解析失败。
+
+    断言通过返回哨兵 ``_TYPE_GUARD_OK``；归因成功返回裁决结果（可能是未知值或兜底值）；
+    既断言失败又无法归因时重新抛出原来的 :py:class:`EvaluationError`。
+    """
+    try:
+        assertion(*values)
+    except errors.EvaluationError:
+        reconciled = _reconcile_type_error(context, *operands, detail=detail)
+        if reconciled is errors.UNDEFINED:
+            raise
+        return reconciled
+    return _TYPE_GUARD_OK
 
 def _iterable_member_value_type(value: Iterable[Any]) -> _DataTypeDef:
     value = (
